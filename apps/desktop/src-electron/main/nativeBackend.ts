@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { app } from "electron";
+import { getConfiguredLogDirectory, writeAppLog } from "./appLogger";
 
 const SUPPORTED_COMMANDS = new Set([
     "ping",
@@ -284,6 +285,7 @@ class NativeBackendSidecar implements NativeBackendBridge {
     private nextId = 1;
     private closed = false;
     private exited = false;
+    private shutdownRequested = false;
 
     constructor(
         executablePath: string,
@@ -293,12 +295,19 @@ class NativeBackendSidecar implements NativeBackendBridge {
         const workspaceRoot = resolveWorkspaceRoot();
         const sidecarPath = buildSidecarPath();
         const acpResourceDir = resolveAcpResourceDir(executablePath);
+        const logDir = getConfiguredLogDirectory();
+        writeAppLog("native-backend", "info", "Starting native backend sidecar", {
+            executablePath,
+            workspaceRoot,
+            acpResourceDir,
+        });
         this.child = spawn(executablePath, [], {
             stdio: ["pipe", "pipe", "pipe"],
             env: {
                 ...process.env,
                 ...(sidecarPath ? { PATH: sidecarPath } : {}),
                 NEVERWRITE_APP_DATA_DIR: app.getPath("userData"),
+                ...(logDir ? { NEVERWRITE_LOG_DIR: logDir } : {}),
                 ...(acpResourceDir
                     ? { NEVERWRITE_ELECTRON_ACP_RESOURCE_DIR: acpResourceDir }
                     : {}),
@@ -311,12 +320,24 @@ class NativeBackendSidecar implements NativeBackendBridge {
             .on("line", (line) => this.handleLine(line));
 
         this.child.stderr.on("data", (chunk) => {
-            console.warn(`[native-backend] ${String(chunk).trimEnd()}`);
+            const message = String(chunk).trimEnd();
+            writeAppLog("native-backend", "warn", message);
+            console.warn(`[native-backend] ${message}`);
         });
 
         this.child.on("error", (error) => {
             this.closed = true;
+            if (this.shutdownRequested) {
+                writeAppLog(
+                    "native-backend",
+                    "info",
+                    "Native backend sidecar closed during shutdown",
+                    error,
+                );
+                return;
+            }
             this.failure = new Error(`Native backend failed to start: ${error.message}`);
+            writeAppLog("native-backend", "error", this.failure.message, error);
             console.error(`[native-backend] ${this.failure.message}`);
             this.rejectPending(this.failure);
         });
@@ -328,9 +349,22 @@ class NativeBackendSidecar implements NativeBackendBridge {
                 clearTimeout(this.forceKillTimer);
                 this.forceKillTimer = null;
             }
+            if (this.shutdownRequested) {
+                writeAppLog(
+                    "native-backend",
+                    "info",
+                    "Native backend sidecar stopped during shutdown",
+                    { code, signal },
+                );
+                return;
+            }
             this.failure = new Error(
                 `Native backend exited with ${code ?? signal ?? "unknown status"}`,
             );
+            writeAppLog("native-backend", "error", this.failure.message, {
+                code,
+                signal,
+            });
             this.rejectPending(this.failure);
         });
     }
@@ -353,7 +387,7 @@ class NativeBackendSidecar implements NativeBackendBridge {
             this.pending.set(id, { resolve, reject });
             this.child.stdin.write(`${payload}\n`, (error) => {
                 if (!error) return;
-                this.pending.delete(id);
+                if (!this.pending.delete(id)) return;
                 reject(error);
             });
         });
@@ -361,6 +395,7 @@ class NativeBackendSidecar implements NativeBackendBridge {
 
     dispose() {
         if (this.closed && this.exited) return;
+        this.shutdownRequested = true;
         this.closed = true;
         this.rejectPending(new Error("Native backend was closed."));
 
@@ -443,6 +478,10 @@ export function createNativeBackendSidecar(
 
     const executablePath = resolution.executablePath;
     if (!executablePath) {
+        writeAppLog("native-backend", "error", "No sidecar executable found", {
+            attemptedPaths: resolution.attemptedPaths,
+            expectedPath: resolution.expectedPath,
+        });
         console.error(
             `[native-backend] No sidecar executable found. Tried:\n${resolution.attemptedPaths
                 .map((candidate) => `- ${candidate}`)

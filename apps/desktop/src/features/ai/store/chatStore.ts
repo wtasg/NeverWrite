@@ -162,6 +162,15 @@ const AI_AUTO_CONTEXT_KEY_PREFIX = "neverwrite.ai.auto-context:";
 const AI_AUTO_CONTEXT_GLOBAL_SCOPE = "__global__";
 const TRANSCRIPT_PAGE_SIZE = 60;
 const TRACKED_PERSISTED_RECONCILE_DELAY_MS = 260;
+const SAVED_CHAT_RECONNECTING_STATUS_EVENT_ID =
+    "neverwrite:recovery:reconnecting-saved-chat";
+const RUNTIME_CONTEXT_RECOVERY_STATUS_EVENT_ID =
+    "neverwrite:recovery:runtime-context";
+const SAVED_CHAT_RECONNECTING_STATUS_TITLE = "Reconnecting saved chat...";
+const RUNTIME_CONTEXT_RECOVERY_STATUS_TITLE =
+    "The AI runtime lost its connection. Reconnecting with saved context...";
+const SAVED_CHAT_RECONNECT_FAILED_MESSAGE =
+    "Could not reconnect this chat. Start a new session with saved transcript context?";
 const _pendingTrackedPersistedReconcileByKey = new Map<
     string,
     ReturnType<typeof setTimeout>
@@ -252,6 +261,10 @@ interface InterruptedTurnState {
     isStopping: boolean;
     ignoreLateActivity: boolean;
     pendingManualSend?: PendingInterruptedSend;
+}
+
+interface UpsertSessionOptions {
+    allowUnknownSession?: boolean;
 }
 
 function aiPrefsEqual(
@@ -1200,7 +1213,12 @@ interface ChatStore {
         anthropicAuthToken: AISecretPatch;
         anthropicApiKey?: AISecretPatch;
     }) => Promise<void>;
-    upsertSession: (session: AIChatSession, activate?: boolean) => void;
+    upsertSession: (
+        session: AIChatSession,
+        activate?: boolean,
+        options?: UpsertSessionOptions,
+    ) => void;
+    dismissMessage: (sessionId: string, messageId: string) => void;
     applySessionError: (payload: AISessionErrorPayload) => void;
     applyRuntimeConnection: (payload: AIRuntimeConnectionPayload) => void;
     applyTokenUsage: (payload: AITokenUsagePayload) => void;
@@ -1444,6 +1462,11 @@ function isContextTooLargeErrorMessage(message: string) {
     );
 }
 
+function isRuntimeSessionDisconnectedErrorMessage(message: string) {
+    const normalized = message.trim().toLowerCase();
+    return normalized.includes("runtime session is not connected");
+}
+
 function normalizeAiErrorMessage(message: string) {
     if (message.includes("No hay vault abierto")) {
         return "Open a vault before starting a chat.";
@@ -1561,6 +1584,57 @@ function replaceSessionMessage(
     };
 }
 
+function removeSessionMessage(session: AIChatSession, messageId: string) {
+    const normalized = normalizeSessionTranscript(session);
+    const index = normalized.messageIndexById![messageId];
+    if (index == null) {
+        return normalized;
+    }
+
+    const nextMessages = normalized.messages.filter(
+        (message) => message.id !== messageId,
+    );
+    const nextMessagesById = { ...normalized.messagesById! };
+    delete nextMessagesById[messageId];
+    const nextMessageOrder = normalized.messageOrder!.filter(
+        (id) => id !== messageId,
+    );
+    const nextMessageIndexById = Object.fromEntries(
+        nextMessages.map((message, messageIndex) => [
+            message.id,
+            messageIndex,
+        ]),
+    );
+
+    const lastAssistantMessageId =
+        normalized.lastAssistantMessageId === messageId
+            ? [...nextMessages]
+                  .reverse()
+                  .find(isAssistantTextMessage)?.id ?? null
+            : (normalized.lastAssistantMessageId ?? null);
+    const lastTurnStartedMessageId =
+        normalized.lastTurnStartedMessageId === messageId
+            ? [...nextMessages]
+                  .reverse()
+                  .find(isTurnStartedStatusMessage)?.id ?? null
+            : (normalized.lastTurnStartedMessageId ?? null);
+
+    const nextSession = {
+        ...normalized,
+        messages: nextMessages,
+        messageOrder: nextMessageOrder,
+        messagesById: nextMessagesById,
+        messageIndexById: nextMessageIndexById,
+        lastAssistantMessageId,
+        lastTurnStartedMessageId,
+    };
+
+    return {
+        ...nextSession,
+        activePlanMessageId: recomputeActivePlanMessageId(nextSession),
+    };
+}
+
 function appendSessionMessage(session: AIChatSession, message: AIChatMessage) {
     const normalized = ensurePersistedTranscriptWindowAnchor(
         normalizeSessionTranscript(session),
@@ -1618,7 +1692,12 @@ function upsertSessionMessage(
 }
 
 function appendSessionError(session: AIChatSession, content: string) {
-    return appendSessionMessage(session, createErrorMessage(content));
+    const normalized = normalizeSessionTranscript(session);
+    const lastMessage = normalized.messages.at(-1);
+    if (lastMessage?.kind === "error" && lastMessage.content === content) {
+        return normalized;
+    }
+    return appendSessionMessage(normalized, createErrorMessage(content));
 }
 
 function stampElapsedOnTurnStartedSession(
@@ -1774,6 +1853,72 @@ function createStatusMessage(payload: AIStatusEventPayload): AIChatMessage {
         },
         toolAction: payload.tool_action ?? null,
     };
+}
+
+function createLocalStatusPayload(
+    sessionId: string,
+    payload: Omit<AIStatusEventPayload, "session_id" | "tool_action">,
+): AIStatusEventPayload {
+    return {
+        ...payload,
+        session_id: sessionId,
+        tool_action: null,
+    };
+}
+
+function createSavedChatReconnectingStatus(
+    sessionId: string,
+): AIStatusEventPayload {
+    return createLocalStatusPayload(sessionId, {
+        event_id: SAVED_CHAT_RECONNECTING_STATUS_EVENT_ID,
+        kind: "session_recovery",
+        status: "in_progress",
+        title: SAVED_CHAT_RECONNECTING_STATUS_TITLE,
+        detail: null,
+        emphasis: "neutral",
+    });
+}
+
+function createRuntimeContextRecoveryStatus(
+    sessionId: string,
+): AIStatusEventPayload {
+    return createLocalStatusPayload(sessionId, {
+        event_id: RUNTIME_CONTEXT_RECOVERY_STATUS_EVENT_ID,
+        kind: "session_recovery",
+        status: "in_progress",
+        title: RUNTIME_CONTEXT_RECOVERY_STATUS_TITLE,
+        detail: null,
+        emphasis: "warning",
+    });
+}
+
+function isTransientRecoveryStatusMessage(message: AIChatMessage) {
+    return (
+        message.kind === "status" &&
+        (message.meta?.status_event === "session_recovery" ||
+            message.id === `status:${SAVED_CHAT_RECONNECTING_STATUS_EVENT_ID}` ||
+            message.id === `status:${RUNTIME_CONTEXT_RECOVERY_STATUS_EVENT_ID}`)
+    );
+}
+
+function upsertSessionStatusMessage(
+    session: AIChatSession,
+    payload: AIStatusEventPayload,
+) {
+    const baseSession = ensureSessionWorkCycle(session);
+    const nextSession = statusEventKeepsSessionStreaming(payload.status)
+        ? markSessionStreamingIfLive(baseSession)
+        : baseSession;
+    const messageId = `status:${payload.event_id}`;
+    const nextMessage = {
+        ...createStatusMessage(payload),
+        id: messageId,
+        workCycleId: nextSession.activeWorkCycleId,
+    };
+
+    return upsertSessionMessage(nextSession, nextMessage, {
+        preserveWorkCycleId: true,
+    });
 }
 
 function isFailedImageGenerationStatus(status: string) {
@@ -4268,9 +4413,13 @@ function getPersistedHistoryMessageCount(
 }
 
 function getSessionPersistedMessageCount(session: AIChatSession) {
+    const persistedWindowMessageCount = getSessionTranscriptMessages(
+        session,
+    ).filter((message) => !isTransientRecoveryStatusMessage(message)).length;
     return Math.max(
         session.persistedMessageCount ?? 0,
-        (session.loadedPersistedMessageStart ?? 0) + session.messages.length,
+        (session.loadedPersistedMessageStart ?? 0) +
+            persistedWindowMessageCount,
     );
 }
 
@@ -4302,6 +4451,13 @@ function hasFullPersistedTranscriptLoaded(session: AIChatSession) {
     return (
         session.loadedPersistedMessageStart === 0 ||
         session.runtimeState !== "live"
+    );
+}
+
+function needsFullResumeContextTranscript(session: AIChatSession) {
+    return (
+        session.resumeContextPending === true &&
+        !hasFullPersistedTranscriptLoaded(session)
     );
 }
 
@@ -4627,6 +4783,8 @@ function mergeSession(
                     isPersistedSession: incoming.isPersistedSession ?? false,
                     resumeContextPending:
                         incoming.resumeContextPending ?? false,
+                    resumeReconnectFailed:
+                        incoming.resumeReconnectFailed ?? false,
                     activeWorkCycleId: incoming.activeWorkCycleId ?? null,
                     visibleWorkCycleId: incoming.visibleWorkCycleId ?? null,
                     // The backend never resets session status to "idle" after streaming,
@@ -4709,8 +4867,12 @@ function mergeSession(
             incoming.isPersistedSession ??
             normalizedExisting.isPersistedSession,
         resumeContextPending:
-            incoming.resumeContextPending ??
-            normalizedExisting.resumeContextPending,
+            incoming.resumeContextPending === true ||
+            normalizedExisting.resumeContextPending === true,
+        resumeReconnectFailed:
+            incoming.resumeReconnectFailed ??
+            normalizedExisting.resumeReconnectFailed ??
+            false,
         activeWorkCycleId:
             incoming.activeWorkCycleId ??
             normalizedExisting.activeWorkCycleId ??
@@ -4814,6 +4976,34 @@ function runtimeSupportsCapability(
         ?.runtime.capabilities.includes(capability);
 }
 
+type ResumeRecoveryStrategy =
+    | "native_load_session"
+    | "transcript_prompt_injection";
+
+function getSessionRuntimeStateForLog(session: AIChatSession) {
+    return (
+        session.runtimeState ??
+        (session.isPersistedSession ? "detached" : "live")
+    );
+}
+
+function logResumeRecovery(
+    event: "started" | "succeeded" | "failed",
+    payload: {
+        resume_strategy: ResumeRecoveryStrategy;
+        history_session_id: string;
+        runtime_id: string;
+        persisted_message_count: number;
+        loaded_persisted_message_start: number | null;
+        resume_context_pending: boolean;
+        runtime_state_before: string;
+        runtime_state_after: string;
+        error_message?: string;
+    },
+) {
+    logDebug("chat-store", `saved chat recovery ${event}`, payload);
+}
+
 function getRuntimeReadyButDisabledMessage(
     runtimes: AIRuntimeDescriptor[],
     runtimeId: string,
@@ -4906,6 +5096,7 @@ function toPersistedHistory(session: AIChatSession): PersistedSessionHistory {
     const hasCatalog = hasRuntimeCatalog(runtimeCatalog);
     const messages = getSessionTranscriptMessages(session)
         .filter((m) => !m.inProgress)
+        .filter((m) => !isTransientRecoveryStatusMessage(m))
         .filter((m) => m.kind !== "permission")
         .map((m) => ({
             id: m.id,
@@ -5479,6 +5670,46 @@ export const useChatStore = create<ChatStore>((set, get) => {
         }
     }
 
+    async function prepareSessionForPromptBuild(
+        sessionId: string,
+    ): Promise<string | null> {
+        let activeSessionId = sessionId;
+        let session = get().sessionsById[activeSessionId];
+        if (!session || session.isResumingSession) {
+            return null;
+        }
+
+        if (!isLiveRuntimeSession(session)) {
+            const resumedSessionId = await get().resumeSession(activeSessionId);
+            if (!resumedSessionId) {
+                return null;
+            }
+
+            activeSessionId = resumedSessionId;
+            session = get().sessionsById[activeSessionId];
+            if (!session || session.isResumingSession) {
+                return null;
+            }
+        }
+
+        if (needsFullResumeContextTranscript(session)) {
+            const loaded = await loadPersistedTranscript(
+                activeSessionId,
+                "full",
+            );
+            if (!loaded) {
+                get().applySessionError({
+                    session_id: activeSessionId,
+                    message:
+                        "Failed to load the full saved transcript before sending.",
+                });
+                return null;
+            }
+        }
+
+        return activeSessionId;
+    }
+
     function patchQueuedMessage(
         sessionId: string,
         messageId: string,
@@ -5964,6 +6195,16 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 currentItem.prompt,
                 currentItem.attachments,
             );
+            set((state) => ({
+                sessionsById: updateSessionById(
+                    state,
+                    activeSessionId,
+                    (current) => ({
+                        ...current,
+                        resumeContextPending: false,
+                    }),
+                ),
+            }));
             get().upsertSession({
                 ...nextSession,
                 historySessionId: session.historySessionId,
@@ -6681,10 +6922,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
             }
         },
 
-        upsertSession: (session, activate = false) => {
+        upsertSession: (session, activate = false, options = {}) => {
             let shouldDrainQueue = false;
             let sessionToPersist: AIChatSession | null = null;
             set((state) => {
+                const allowUnknownSession =
+                    options.allowUnknownSession === true;
                 const currentVaultPath = useVaultStore.getState().vaultPath;
                 const existing = state.sessionsById[session.sessionId];
                 const sessionVaultPath =
@@ -6736,8 +6979,14 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 }
 
                 // Ignore unexpected sessions unless explicitly activated by
-                // this vault/window lifecycle.
-                if (!isKnown && !activate && !isKnownChildSession) {
+                // this vault/window lifecycle or imported from a trusted
+                // detached-window transfer payload.
+                if (
+                    !isKnown &&
+                    !activate &&
+                    !isKnownChildSession &&
+                    !allowUnknownSession
+                ) {
                     return state;
                 }
 
@@ -6781,7 +7030,8 @@ export const useChatStore = create<ChatStore>((set, get) => {
                               state.sessionOrder,
                               scopedSession.sessionId,
                           )
-                        : !isKnown && isKnownChildSession
+                        : !isKnown &&
+                            (isKnownChildSession || allowUnknownSession)
                           ? insertSessionAfterParent(
                                 state.sessionOrder,
                                 scopedSession.sessionId,
@@ -6813,6 +7063,39 @@ export const useChatStore = create<ChatStore>((set, get) => {
             if (shouldDrainQueue) {
                 void get().tryDrainQueue(session.sessionId);
             }
+            if (sessionToPersist) {
+                void persistSession(sessionToPersist);
+            }
+        },
+
+        dismissMessage: (sessionId, messageId) => {
+            let sessionToPersist: AIChatSession | null = null;
+            set((state) => {
+                const session = state.sessionsById[sessionId];
+                if (!session) return state;
+                const message = normalizeSessionTranscript(session).messagesById?.[
+                    messageId
+                ];
+                if (!message) return state;
+
+                const nextSession = {
+                    ...removeSessionMessage(session, messageId),
+                    resumeReconnectFailed:
+                        message.kind === "error" &&
+                        message.content === SAVED_CHAT_RECONNECT_FAILED_MESSAGE
+                            ? false
+                            : session.resumeReconnectFailed,
+                };
+                sessionToPersist = nextSession;
+
+                return {
+                    sessionsById: {
+                        ...state.sessionsById,
+                        [sessionId]: nextSession,
+                    },
+                };
+            });
+
             if (sessionToPersist) {
                 void persistSession(sessionToPersist);
             }
@@ -6851,19 +7134,23 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     clearStaleStreamingCheck(sessionId);
                     affectedSessionIds.push(sessionId);
                     changed = true;
+                    const detachedSession = {
+                        ...markPendingInteractionMessagesIdle(session),
+                        isPersistedSession: true,
+                        isResumingSession: false,
+                        runtimeState: "detached" as const,
+                        status: "error" as const,
+                        resumeContextPending: true,
+                    };
                     const revertedSession = finalizeActionLogForWorkCycle(
                         stampElapsedOnTurnStartedSession(
                             appendSessionError(
-                                {
-                                    ...markPendingInteractionMessagesIdle(
-                                        session,
+                                upsertSessionStatusMessage(
+                                    detachedSession,
+                                    createRuntimeContextRecoveryStatus(
+                                        sessionId,
                                     ),
-                                    isPersistedSession: true,
-                                    isResumingSession: false,
-                                    runtimeState: "detached" as const,
-                                    status: "error" as const,
-                                    resumeContextPending: true,
-                                },
+                                ),
                                 message ??
                                     "The AI runtime disconnected unexpectedly.",
                             ),
@@ -7018,6 +7305,28 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     ...markPendingInteractionMessagesIdle(session),
                     isResumingSession: false,
                 });
+                const shouldDetachRuntimeSession =
+                    isLiveRuntimeSession(revertedSession) &&
+                    isRuntimeSessionDisconnectedErrorMessage(message);
+                const erroredSession = {
+                    ...revertedSession,
+                    status: "error" as const,
+                    isPersistedSession: shouldDetachRuntimeSession
+                        ? true
+                        : revertedSession.isPersistedSession,
+                    resumeContextPending: shouldDetachRuntimeSession
+                        ? getSessionTranscriptLength(revertedSession) > 0
+                        : revertedSession.resumeContextPending,
+                    runtimeState: shouldDetachRuntimeSession
+                        ? ("detached" as const)
+                        : (revertedSession.runtimeState ?? "live"),
+                };
+                const sessionWithRecoveryStatus = shouldDetachRuntimeSession
+                    ? upsertSessionStatusMessage(
+                          erroredSession,
+                          createRuntimeContextRecoveryStatus(session_id),
+                      )
+                    : erroredSession;
                 return {
                     setupStatusByRuntimeId: nextSetupStatusByRuntimeId,
                     runtimeConnectionByRuntimeId:
@@ -7026,12 +7335,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                         ...state.sessionsById,
                         [session_id]: stampElapsedOnTurnStartedSession(
                             appendSessionError(
-                                {
-                                    ...revertedSession,
-                                    status: "error",
-                                    runtimeState:
-                                        revertedSession.runtimeState ?? "live",
-                                },
+                                sessionWithRecoveryStatus,
                                 message,
                             ),
                             failedAt,
@@ -7403,31 +7707,13 @@ export const useChatStore = create<ChatStore>((set, get) => {
             set((state) => {
                 const session = state.sessionsById[payload.session_id];
                 if (!session) return state;
-                const baseSession = ensureSessionWorkCycle(session);
-                const nextSession = statusEventKeepsSessionStreaming(
-                    payload.status,
-                )
-                    ? markSessionStreamingIfLive(baseSession)
-                    : baseSession;
-
-                const messageId = `status:${payload.event_id}`;
-                const nextMessage = {
-                    ...createStatusMessage(payload),
-                    workCycleId: nextSession.activeWorkCycleId,
-                };
 
                 return {
                     sessionsById: {
                         ...state.sessionsById,
-                        [payload.session_id]: upsertSessionMessage(
-                            nextSession,
-                            {
-                                ...nextMessage,
-                                id: messageId,
-                            },
-                            {
-                                preserveWorkCycleId: true,
-                            },
+                        [payload.session_id]: upsertSessionStatusMessage(
+                            session,
+                            payload,
                         ),
                     },
                     sessionOrder: touchSessionOrder(
@@ -7807,13 +8093,85 @@ export const useChatStore = create<ChatStore>((set, get) => {
                 return {
                     sessionsById: {
                         ...currentState.sessionsById,
-                        [sessionId]: {
-                            ...currentSession,
-                            isResumingSession: true,
-                        },
+                        [sessionId]: upsertSessionStatusMessage(
+                            {
+                                ...currentSession,
+                                isResumingSession: true,
+                                resumeReconnectFailed: false,
+                            },
+                            createSavedChatReconnectingStatus(sessionId),
+                        ),
                     },
                 };
             });
+
+            const createTranscriptResumeSession = async (
+                latestSession: AIChatSession,
+                vaultPath: string | null,
+            ) => {
+                let resumedSession = await aiCreateSession(
+                    latestSession.runtimeId,
+                    vaultPath,
+                );
+                const resumedModelConfig = getModelConfigOption(resumedSession);
+
+                if (
+                    resumedSession.modelId !== latestSession.modelId &&
+                    supportsModelSelection(resumedSession, latestSession.modelId)
+                ) {
+                    resumedSession = resumedModelConfig
+                        ? await aiSetConfigOption(
+                              resumedSession.sessionId,
+                              resumedModelConfig.id,
+                              latestSession.modelId,
+                          )
+                        : await aiSetModel(
+                              resumedSession.sessionId,
+                              latestSession.modelId,
+                          );
+                }
+
+                if (
+                    resumedSession.modeId !== latestSession.modeId &&
+                    resumedSession.modes.some(
+                        (mode) =>
+                            mode.id === latestSession.modeId && !mode.disabled,
+                    )
+                ) {
+                    resumedSession = await aiSetMode(
+                        resumedSession.sessionId,
+                        latestSession.modeId,
+                    );
+                }
+
+                for (const option of latestSession.configOptions) {
+                    const current = resumedSession.configOptions.find(
+                        (candidate) => candidate.id === option.id,
+                    );
+                    if (
+                        current &&
+                        current.value !== option.value &&
+                        current.options.some(
+                            (candidate) => candidate.value === option.value,
+                        )
+                    ) {
+                        resumedSession = await aiSetConfigOption(
+                            resumedSession.sessionId,
+                            option.id,
+                            option.value,
+                        );
+                    }
+                }
+
+                return {
+                    resumedSession,
+                    resumeContextPending: getSessionTranscriptMessages(
+                        latestSession,
+                    ).some(
+                        (message) => !isTransientRecoveryStatusMessage(message),
+                    ),
+                };
+            };
 
             try {
                 const currentSession = get().sessionsById[sessionId];
@@ -7827,6 +8185,12 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     currentSession.runtimeId,
                     "resume_session",
                 );
+                let resumeStrategy: ResumeRecoveryStrategy =
+                    supportsNativeResume
+                        ? "native_load_session"
+                        : "transcript_prompt_injection";
+                const runtimeStateBefore =
+                    getSessionRuntimeStateForLog(currentSession);
                 const transcriptLoaded = supportsNativeResume
                     ? await loadPersistedTranscript(sessionId, "latest")
                     : await loadPersistedTranscript(sessionId, "full");
@@ -7838,83 +8202,103 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     );
                 }
 
-                const latestSession =
+                let latestSession =
                     get().sessionsById[sessionId] ?? currentSession;
                 const historySessionId =
                     getRuntimeHistorySessionId(latestSession);
-                const latestCatalog = getRuntimeCatalogSnapshot(latestSession);
+                let latestCatalog = getRuntimeCatalogSnapshot(latestSession);
+                logResumeRecovery("started", {
+                    resume_strategy: resumeStrategy,
+                    history_session_id: historySessionId,
+                    runtime_id: latestSession.runtimeId,
+                    persisted_message_count:
+                        getSessionPersistedMessageCount(latestSession),
+                    loaded_persisted_message_start:
+                        latestSession.loadedPersistedMessageStart ?? null,
+                    resume_context_pending:
+                        latestSession.resumeContextPending === true,
+                    runtime_state_before: runtimeStateBefore,
+                    runtime_state_after: getSessionRuntimeStateForLog(
+                        latestSession,
+                    ),
+                });
 
                 let resumedSession: AIChatSession;
                 let resumeContextPending = false;
 
                 if (supportsNativeResume) {
-                    resumedSession = await aiResumeRuntimeSession(
-                        latestSession.runtimeId,
-                        historySessionId,
-                        vaultPath,
-                    );
-                } else {
-                    resumedSession = await aiCreateSession(
-                        latestSession.runtimeId,
-                        vaultPath,
-                    );
-                    const resumedModelConfig =
-                        getModelConfigOption(resumedSession);
-
-                    if (
-                        resumedSession.modelId !== latestSession.modelId &&
-                        supportsModelSelection(
-                            resumedSession,
-                            latestSession.modelId,
-                        )
-                    ) {
-                        resumedSession = resumedModelConfig
-                            ? await aiSetConfigOption(
-                                  resumedSession.sessionId,
-                                  resumedModelConfig.id,
-                                  latestSession.modelId,
-                              )
-                            : await aiSetModel(
-                                  resumedSession.sessionId,
-                                  latestSession.modelId,
-                              );
-                    }
-
-                    if (
-                        resumedSession.modeId !== latestSession.modeId &&
-                        resumedSession.modes.some(
-                            (mode) =>
-                                mode.id === latestSession.modeId &&
-                                !mode.disabled,
-                        )
-                    ) {
-                        resumedSession = await aiSetMode(
-                            resumedSession.sessionId,
-                            latestSession.modeId,
+                    try {
+                        resumedSession = await aiResumeRuntimeSession(
+                            latestSession.runtimeId,
+                            historySessionId,
+                            vaultPath,
                         );
-                    }
-
-                    for (const option of latestSession.configOptions) {
-                        const current = resumedSession.configOptions.find(
-                            (candidate) => candidate.id === option.id,
+                    } catch (nativeResumeError) {
+                        const nativeResumeMessage = getAiErrorMessage(
+                            nativeResumeError,
+                            "Failed to reconnect the saved runtime session.",
                         );
-                        if (
-                            current &&
-                            current.value !== option.value &&
-                            current.options.some(
-                                (candidate) => candidate.value === option.value,
-                            )
-                        ) {
-                            resumedSession = await aiSetConfigOption(
-                                resumedSession.sessionId,
-                                option.id,
-                                option.value,
+                        logResumeRecovery("failed", {
+                            resume_strategy: "native_load_session",
+                            history_session_id: historySessionId,
+                            runtime_id: latestSession.runtimeId,
+                            persisted_message_count:
+                                getSessionPersistedMessageCount(latestSession),
+                            loaded_persisted_message_start:
+                                latestSession.loadedPersistedMessageStart ??
+                                null,
+                            resume_context_pending:
+                                latestSession.resumeContextPending === true,
+                            runtime_state_before: runtimeStateBefore,
+                            runtime_state_after:
+                                getSessionRuntimeStateForLog(latestSession),
+                            error_message: nativeResumeMessage,
+                        });
+
+                        const fullTranscriptLoaded =
+                            await loadPersistedTranscript(sessionId, "full");
+                        if (!fullTranscriptLoaded) {
+                            throw new Error(
+                                "Failed to load the full saved transcript after native resume failed.",
                             );
                         }
-                    }
 
-                    resumeContextPending =
-                        getSessionTranscriptLength(latestSession) > 0;
+                        latestSession =
+                            get().sessionsById[sessionId] ?? latestSession;
+                        latestCatalog =
+                            getRuntimeCatalogSnapshot(latestSession);
+                        resumeStrategy = "transcript_prompt_injection";
+                        logResumeRecovery("started", {
+                            resume_strategy: resumeStrategy,
+                            history_session_id: historySessionId,
+                            runtime_id: latestSession.runtimeId,
+                            persisted_message_count:
+                                getSessionPersistedMessageCount(latestSession),
+                            loaded_persisted_message_start:
+                                latestSession.loadedPersistedMessageStart ??
+                                null,
+                            resume_context_pending:
+                                latestSession.resumeContextPending === true,
+                            runtime_state_before: runtimeStateBefore,
+                            runtime_state_after:
+                                getSessionRuntimeStateForLog(latestSession),
+                            error_message: nativeResumeMessage,
+                        });
+                        const fallback =
+                            await createTranscriptResumeSession(
+                                latestSession,
+                                vaultPath,
+                            );
+                        resumedSession = fallback.resumedSession;
+                        resumeContextPending = fallback.resumeContextPending;
+                    }
+                } else {
+                    const fallback = await createTranscriptResumeSession(
+                        latestSession,
+                        vaultPath,
+                    );
+                    resumedSession = fallback.resumedSession;
+                    resumeContextPending = fallback.resumeContextPending;
                 }
 
                 if (hasRuntimeCatalog(latestCatalog)) {
@@ -7945,6 +8329,7 @@ export const useChatStore = create<ChatStore>((set, get) => {
                                 {},
                             isPersistedSession: false,
                             isResumingSession: false,
+                            resumeReconnectFailed: false,
                             resumeContextPending,
                             runtimeState: "live",
                             persistedCreatedAt:
@@ -7962,11 +8347,29 @@ export const useChatStore = create<ChatStore>((set, get) => {
                                 latestSession.loadedPersistedMessageStart ?? 0,
                             isLoadingPersistedMessages: false,
                         },
-                        getSessionTranscriptMessages(latestSession),
+                        getSessionTranscriptMessages(latestSession).filter(
+                            (message) =>
+                                !isTransientRecoveryStatusMessage(message),
+                        ),
                     ),
                 );
 
                 migrateSessionLocalState(sessionId, migratedSession);
+                logResumeRecovery("succeeded", {
+                    resume_strategy: resumeStrategy,
+                    history_session_id: historySessionId,
+                    runtime_id: migratedSession.runtimeId,
+                    persisted_message_count:
+                        getSessionPersistedMessageCount(migratedSession),
+                    loaded_persisted_message_start:
+                        migratedSession.loadedPersistedMessageStart ?? null,
+                    resume_context_pending:
+                        migratedSession.resumeContextPending === true,
+                    runtime_state_before: runtimeStateBefore,
+                    runtime_state_after: getSessionRuntimeStateForLog(
+                        migratedSession,
+                    ),
+                });
 
                 return migratedSession.sessionId;
             } catch (error) {
@@ -7974,7 +8377,49 @@ export const useChatStore = create<ChatStore>((set, get) => {
                     error,
                     "Failed to resume the saved chat.",
                 );
-                get().applySessionError({ session_id: sessionId, message });
+                const failedSession = get().sessionsById[sessionId] ?? session;
+                const supportsNativeResume = runtimeSupportsCapability(
+                    get().runtimes,
+                    failedSession.runtimeId,
+                    "resume_session",
+                );
+                logResumeRecovery("failed", {
+                    resume_strategy: supportsNativeResume
+                        ? "native_load_session"
+                        : "transcript_prompt_injection",
+                    history_session_id: getRuntimeHistorySessionId(
+                        failedSession,
+                    ),
+                    runtime_id: failedSession.runtimeId,
+                    persisted_message_count:
+                        getSessionPersistedMessageCount(failedSession),
+                    loaded_persisted_message_start:
+                        failedSession.loadedPersistedMessageStart ?? null,
+                    resume_context_pending:
+                        failedSession.resumeContextPending === true,
+                    runtime_state_before: getSessionRuntimeStateForLog(session),
+                    runtime_state_after:
+                        getSessionRuntimeStateForLog(failedSession),
+                    error_message: message,
+                });
+                set((state) => {
+                    const current = state.sessionsById[sessionId];
+                    if (!current) return state;
+                    return {
+                        sessionsById: {
+                            ...state.sessionsById,
+                            [sessionId]: {
+                                ...current,
+                                isResumingSession: false,
+                                resumeReconnectFailed: true,
+                            },
+                        },
+                    };
+                });
+                get().applySessionError({
+                    session_id: sessionId,
+                    message: SAVED_CHAT_RECONNECT_FAILED_MESSAGE,
+                });
                 if (isAuthenticationErrorMessage(message)) {
                     await get().refreshSetupStatus(
                         get().sessionsById[sessionId]?.runtimeId,
@@ -8411,12 +8856,30 @@ export const useChatStore = create<ChatStore>((set, get) => {
         },
 
         sendMessage: async (sessionId) => {
-            const resolvedSessionId = sessionId ?? get().activeSessionId;
+            let resolvedSessionId = sessionId ?? get().activeSessionId;
             if (!resolvedSessionId) return;
-            const { sessionsById, composerPartsBySessionId } = get();
-            const session = sessionsById[resolvedSessionId];
+
+            let { sessionsById, composerPartsBySessionId } = get();
+            let session = sessionsById[resolvedSessionId];
             if (!session || session.isResumingSession) {
                 return;
+            }
+
+            if (
+                !isLiveRuntimeSession(session) ||
+                needsFullResumeContextTranscript(session)
+            ) {
+                const preparedSessionId =
+                    await prepareSessionForPromptBuild(resolvedSessionId);
+                if (!preparedSessionId) {
+                    return;
+                }
+                resolvedSessionId = preparedSessionId;
+                ({ sessionsById, composerPartsBySessionId } = get());
+                session = sessionsById[resolvedSessionId];
+                if (!session || session.isResumingSession) {
+                    return;
+                }
             }
 
             const composerParts =

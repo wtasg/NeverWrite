@@ -603,6 +603,51 @@ describe("chatStore", () => {
         ).toBe("streaming");
     });
 
+    it("continues rejecting unexpected non-active root session upserts", () => {
+        useChatStore
+            .getState()
+            .upsertSession(createSessionWithTrackedFiles("unexpected-root", []));
+
+        expect(
+            useChatStore.getState().sessionsById["unexpected-root"],
+        ).toBeUndefined();
+    });
+
+    it("hydrates trusted detached-window session groups without dropping relatives", () => {
+        const parent = {
+            ...createSessionWithTrackedFiles("parent-session", []),
+            historySessionId: "parent-history",
+        };
+        const child = {
+            ...createSessionWithTrackedFiles("child-session", []),
+            historySessionId: "child-history",
+            parentSessionId: "parent-history",
+            runtimeSessionId: "child-runtime",
+        };
+        const sibling = {
+            ...createSessionWithTrackedFiles("sibling-session", []),
+            historySessionId: "sibling-history",
+            parentSessionId: "parent-history",
+            runtimeSessionId: "sibling-runtime",
+        };
+
+        useChatStore
+            .getState()
+            .upsertSession(child, true, { allowUnknownSession: true });
+        useChatStore
+            .getState()
+            .upsertSession(parent, false, { allowUnknownSession: true });
+        useChatStore
+            .getState()
+            .upsertSession(sibling, false, { allowUnknownSession: true });
+
+        const state = useChatStore.getState();
+        expect(state.activeSessionId).toBe("child-session");
+        expect(state.sessionsById["child-session"]).toBeDefined();
+        expect(state.sessionsById["parent-session"]).toBeDefined();
+        expect(state.sessionsById["sibling-session"]).toBeDefined();
+    });
+
     it("persists auto context per vault path", () => {
         useVaultStore.setState({ vaultPath: "/vaults/one" });
         resetChatStore();
@@ -8713,6 +8758,400 @@ describe("chatStore", () => {
         });
     });
 
+    it("sends saved transcript context when sending from a detached Codex session", async () => {
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+
+        const detachedSessionId = "persisted:history-codex-detached";
+        const historySessionId = "history-codex-detached";
+        const resumedSessionId = "codex-session-recovered";
+        let sentContent = "";
+
+        useChatStore.setState((state) => ({
+            ...state,
+            runtimes: [
+                {
+                    runtime: runtimePayload[0].runtime,
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            sessionsById: {
+                [detachedSessionId]: {
+                    ...createSessionWithTrackedFiles(detachedSessionId, []),
+                    historySessionId,
+                    runtimeId: "codex-acp",
+                    runtimeState: "detached",
+                    isPersistedSession: true,
+                    status: "idle",
+                    persistedMessageCount: 2,
+                    loadedPersistedMessageStart: null,
+                    messages: [],
+                },
+            },
+            sessionOrder: [detachedSessionId],
+            activeSessionId: detachedSessionId,
+            selectedRuntimeId: "codex-acp",
+            composerPartsBySessionId: {
+                [detachedSessionId]: [],
+            },
+        }));
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_load_session_history_page") {
+                expect(args).toMatchObject({
+                    sessionId: historySessionId,
+                    vaultPath: "/vault",
+                    startIndex: 0,
+                    limit: 2,
+                });
+                return {
+                    session_id: historySessionId,
+                    total_messages: 2,
+                    start_index: 0,
+                    end_index: 2,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "user",
+                            kind: "text",
+                            content: "Remember the prior requirement",
+                            timestamp: 10,
+                        },
+                        {
+                            id: "m2",
+                            role: "assistant",
+                            kind: "text",
+                            content: "I will keep that constraint in mind.",
+                            timestamp: 20,
+                        },
+                    ],
+                };
+            }
+
+            if (command === "ai_create_session") {
+                return {
+                    ...sessionPayload,
+                    session_id: resumedSessionId,
+                };
+            }
+
+            if (command === "ai_send_message") {
+                sentContent = (args as { content: string }).content;
+                return {
+                    ...sessionPayload,
+                    session_id: resumedSessionId,
+                    status: "streaming",
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        useChatStore
+            .getState()
+            .setComposerParts(
+                createTextParts("Continue from there"),
+                detachedSessionId,
+            );
+
+        await useChatStore.getState().sendMessage(detachedSessionId);
+
+        expect(
+            useChatStore.getState().sessionsById[resumedSessionId],
+        ).toMatchObject({
+            runtimeState: "live",
+            isPersistedSession: false,
+            resumeContextPending: false,
+        });
+
+        expect(sentContent).toContain("Saved transcript:");
+        expect(sentContent).toContain("User: Remember the prior requirement");
+        expect(sentContent).toContain("New user message: Continue from there");
+    });
+
+    it("includes saved transcript context for live Codex sessions with pending recovery", async () => {
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        let sentContent = "";
+
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    runtimeState: "live",
+                    status: "idle",
+                    resumeContextPending: true,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "user",
+                            kind: "text",
+                            content: "The saved context matters",
+                            timestamp: 10,
+                        },
+                    ],
+                },
+            },
+        }));
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                sentContent = (args as { content: string }).content;
+                return {
+                    ...sessionPayload,
+                    session_id: activeSessionId,
+                    status: "streaming",
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+        invokeMock.mockClear();
+
+        useChatStore
+            .getState()
+            .setComposerParts(createTextParts("Keep going"), activeSessionId);
+
+        await useChatStore.getState().sendMessage(activeSessionId);
+
+        expect(sentContent).toContain("Saved transcript:");
+        expect(sentContent).toContain("User: The saved context matters");
+        expect(sentContent).toContain("New user message: Keep going");
+        expect(
+            invokeMock.mock.calls.some(
+                ([command]) => command === "ai_create_session",
+            ),
+        ).toBe(false);
+    });
+
+    it("loads the full saved transcript before sending live Codex recovery prompts", async () => {
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        let sentContent = "";
+
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    historySessionId: "history-live-pending",
+                    runtimeState: "live",
+                    status: "idle",
+                    resumeContextPending: true,
+                    persistedMessageCount: 2,
+                    loadedPersistedMessageStart: 1,
+                    messages: [
+                        {
+                            id: "m2",
+                            role: "assistant",
+                            kind: "text",
+                            content: "Tail context only",
+                            timestamp: 20,
+                        },
+                    ],
+                },
+            },
+        }));
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_load_session_history_page") {
+                expect(args).toMatchObject({
+                    sessionId: "history-live-pending",
+                    vaultPath: "/vault",
+                    startIndex: 0,
+                    limit: 2,
+                });
+                return {
+                    session_id: "history-live-pending",
+                    total_messages: 2,
+                    start_index: 0,
+                    end_index: 2,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "user",
+                            kind: "text",
+                            content: "Older recovered context",
+                            timestamp: 10,
+                        },
+                        {
+                            id: "m2",
+                            role: "assistant",
+                            kind: "text",
+                            content: "Tail context only",
+                            timestamp: 20,
+                        },
+                    ],
+                };
+            }
+
+            if (command === "ai_send_message") {
+                sentContent = (args as { content: string }).content;
+                return {
+                    ...sessionPayload,
+                    session_id: activeSessionId,
+                    status: "streaming",
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        useChatStore
+            .getState()
+            .setComposerParts(createTextParts("Continue"), activeSessionId);
+
+        await useChatStore.getState().sendMessage(activeSessionId);
+
+        expect(sentContent).toContain("Saved transcript:");
+        expect(sentContent).toContain("User: Older recovered context");
+        expect(sentContent).toContain("Assistant: Tail context only");
+        expect(
+            useChatStore.getState().sessionsById[activeSessionId]
+                ?.resumeContextPending,
+        ).toBe(false);
+    });
+
+    it("keeps pending resume context across backend upserts until a prompt sends", async () => {
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+        let sentContent = "";
+
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    runtimeState: "live",
+                    status: "idle",
+                    resumeContextPending: true,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "user",
+                            kind: "text",
+                            content: "Do not drop me on config refresh",
+                            timestamp: 10,
+                        },
+                    ],
+                },
+            },
+        }));
+
+        const pendingSession =
+            useChatStore.getState().sessionsById[activeSessionId]!;
+        useChatStore.getState().upsertSession({
+            ...pendingSession,
+            resumeContextPending: false,
+            messages: [],
+            attachments: [],
+            status: "idle",
+        });
+
+        expect(
+            useChatStore.getState().sessionsById[activeSessionId]
+                ?.resumeContextPending,
+        ).toBe(true);
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                sentContent = (args as { content: string }).content;
+                return {
+                    ...sessionPayload,
+                    session_id: activeSessionId,
+                    status: "streaming",
+                };
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        useChatStore
+            .getState()
+            .setComposerParts(createTextParts("Now continue"), activeSessionId);
+
+        await useChatStore.getState().sendMessage(activeSessionId);
+
+        expect(sentContent).toContain("Saved transcript:");
+        expect(sentContent).toContain("User: Do not drop me on config refresh");
+        expect(
+            useChatStore.getState().sessionsById[activeSessionId]
+                ?.resumeContextPending,
+        ).toBe(false);
+    });
+
+    it("detaches live Codex sessions when the backend has no connected runtime handle", async () => {
+        await useChatStore.getState().initialize();
+
+        const activeSessionId = getActiveSessionId();
+
+        useChatStore.setState((state) => ({
+            sessionsById: {
+                ...state.sessionsById,
+                [activeSessionId]: {
+                    ...state.sessionsById[activeSessionId]!,
+                    runtimeState: "live",
+                    status: "idle",
+                    resumeContextPending: false,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "assistant",
+                            kind: "text",
+                            content: "Recovered answer",
+                            timestamp: 10,
+                        },
+                    ],
+                },
+            },
+        }));
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_send_message") {
+                throw new Error("AI runtime session is not connected.");
+            }
+
+            return defaultInvokeImplementation(command, args);
+        });
+
+        useChatStore
+            .getState()
+            .setComposerParts(createTextParts("Continue"), activeSessionId);
+
+        await useChatStore.getState().sendMessage(activeSessionId);
+
+        expect(
+            useChatStore.getState().sessionsById[activeSessionId],
+        ).toMatchObject({
+            status: "error",
+            runtimeState: "detached",
+            isPersistedSession: true,
+            resumeContextPending: true,
+        });
+        expect(
+            useChatStore
+                .getState()
+                .sessionsById[activeSessionId]?.messages.some(
+                    (message) =>
+                        message.kind === "status" &&
+                        message.content ===
+                            "The AI runtime lost its connection. Reconnecting with saved context...",
+                ),
+        ).toBe(true);
+    });
+
     it("aborts resume when the required persisted transcript page cannot be loaded", async () => {
         useVaultStore.setState({
             vaultPath: "/vault",
@@ -8786,8 +9225,243 @@ describe("chatStore", () => {
         ).toMatchObject({
             kind: "error",
             content:
-                "Failed to load the full saved transcript before resuming.",
+                "Could not reconnect this chat. Start a new session with saved transcript context?",
         });
+        expect(
+            useChatStore.getState().sessionsById["persisted:history-1"]
+                ?.resumeReconnectFailed,
+        ).toBe(true);
+    });
+
+    it("deduplicates repeated saved-chat reconnect failures", async () => {
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+
+        useChatStore.setState((state) => ({
+            ...state,
+            runtimes: [
+                {
+                    runtime: runtimePayload[0].runtime,
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            sessionsById: {
+                "persisted:history-1": {
+                    sessionId: "persisted:history-1",
+                    historySessionId: "history-1",
+                    status: "idle",
+                    runtimeId: "codex-acp",
+                    modelId: "test-model",
+                    modeId: "default",
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                    messages: [],
+                    attachments: [],
+                    runtimeState: "persisted_only",
+                    isPersistedSession: true,
+                    persistedMessageCount: 80,
+                    loadedPersistedMessageStart: null,
+                    resumeContextPending: false,
+                },
+            },
+            sessionOrder: ["persisted:history-1"],
+            activeSessionId: "persisted:history-1",
+            selectedRuntimeId: "codex-acp",
+        }));
+
+        invokeMock.mockImplementation(async (command) => {
+            if (command === "ai_load_session_history_page") {
+                throw new Error("disk read failed");
+            }
+            return defaultInvokeImplementation(command);
+        });
+
+        await useChatStore.getState().resumeSession("persisted:history-1");
+        await useChatStore.getState().resumeSession("persisted:history-1");
+
+        const failedMessages =
+            useChatStore
+                .getState()
+                .sessionsById["persisted:history-1"]?.messages.filter(
+                    (message) =>
+                        message.kind === "error" &&
+                        message.content ===
+                            "Could not reconnect this chat. Start a new session with saved transcript context?",
+                ) ?? [];
+
+        expect(failedMessages).toHaveLength(1);
+    });
+
+    it("dismisses persisted reconnect errors and allows manual retry", () => {
+        const session = createSessionWithTrackedFiles("persisted:history-1", []);
+        useChatStore.setState((state) => ({
+            ...state,
+            sessionsById: {
+                "persisted:history-1": {
+                    ...session,
+                    sessionId: "persisted:history-1",
+                    historySessionId: "history-1",
+                    runtimeState: "persisted_only",
+                    isPersistedSession: true,
+                    resumeReconnectFailed: true,
+                    messages: [
+                        {
+                            id: "error:reconnect",
+                            role: "assistant",
+                            kind: "error",
+                            content:
+                                "Could not reconnect this chat. Start a new session with saved transcript context?",
+                            timestamp: 10,
+                        },
+                    ],
+                },
+            },
+            sessionOrder: ["persisted:history-1"],
+            activeSessionId: "persisted:history-1",
+        }));
+
+        useChatStore
+            .getState()
+            .dismissMessage("persisted:history-1", "error:reconnect");
+
+        expect(
+            useChatStore.getState().sessionsById["persisted:history-1"]
+                ?.messages,
+        ).toEqual([]);
+        expect(
+            useChatStore.getState().sessionsById["persisted:history-1"]
+                ?.resumeReconnectFailed,
+        ).toBe(false);
+    });
+
+    it("falls back to transcript context when native saved-chat resume fails", async () => {
+        useVaultStore.setState({
+            vaultPath: "/vault",
+            notes: [],
+        });
+
+        const persistedSessionId = "persisted:history-native-fallback";
+        const historySessionId = "history-native-fallback";
+        const fallbackSessionId = "codex-fallback-live";
+
+        useChatStore.setState((state) => ({
+            ...state,
+            runtimes: [
+                {
+                    runtime: {
+                        ...runtimePayload[0].runtime,
+                        capabilities: [
+                            ...runtimePayload[0].runtime.capabilities,
+                            "resume_session",
+                        ],
+                    },
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                },
+            ],
+            sessionsById: {
+                [persistedSessionId]: {
+                    sessionId: persistedSessionId,
+                    historySessionId,
+                    status: "idle",
+                    runtimeId: "codex-acp",
+                    modelId: "test-model",
+                    modeId: "default",
+                    models: [],
+                    modes: [],
+                    configOptions: [],
+                    messages: [],
+                    attachments: [],
+                    runtimeState: "persisted_only",
+                    isPersistedSession: true,
+                    persistedMessageCount: 2,
+                    loadedPersistedMessageStart: null,
+                    resumeContextPending: false,
+                },
+            },
+            sessionOrder: [persistedSessionId],
+            activeSessionId: persistedSessionId,
+            selectedRuntimeId: "codex-acp",
+        }));
+
+        invokeMock.mockImplementation(async (command, args) => {
+            if (command === "ai_load_session_history_page") {
+                expect(args).toMatchObject({
+                    sessionId: historySessionId,
+                    vaultPath: "/vault",
+                });
+                return {
+                    session_id: historySessionId,
+                    total_messages: 2,
+                    start_index: 0,
+                    end_index: 2,
+                    messages: [
+                        {
+                            id: "m1",
+                            role: "user",
+                            kind: "text",
+                            content: "Original saved request",
+                            timestamp: 10,
+                        },
+                        {
+                            id: "m2",
+                            role: "assistant",
+                            kind: "text",
+                            content: "Original saved answer",
+                            timestamp: 20,
+                        },
+                    ],
+                };
+            }
+            if (command === "ai_resume_runtime_session") {
+                throw new Error("native resume handle missing");
+            }
+            if (command === "ai_create_session") {
+                return {
+                    ...sessionPayload,
+                    session_id: fallbackSessionId,
+                };
+            }
+            return defaultInvokeImplementation(command, args);
+        });
+
+        const resumedSessionId = await useChatStore
+            .getState()
+            .resumeSession(persistedSessionId);
+
+        expect(resumedSessionId).toBe(fallbackSessionId);
+        expect(useChatStore.getState().sessionsById[fallbackSessionId]).toMatchObject(
+            {
+                runtimeState: "live",
+                isPersistedSession: false,
+                resumeContextPending: true,
+                resumeReconnectFailed: false,
+            },
+        );
+        expect(useChatStore.getState().sessionsById[persistedSessionId]).toBe(
+            undefined,
+        );
+        expect(
+            useChatStore
+                .getState()
+                .sessionsById[fallbackSessionId]?.messages.some(
+                    (message) =>
+                        message.kind === "error" &&
+                        message.content ===
+                            "Could not reconnect this chat. Start a new session with saved transcript context?",
+                ),
+        ).toBe(false);
+        expect(
+            invokeMock.mock.calls.some(
+                ([command]) => command === "ai_create_session",
+            ),
+        ).toBe(true);
     });
 
     it("does not ask the runtime backend to load an unknown persisted-only session id", async () => {
@@ -9896,6 +10570,15 @@ describe("chatStore", () => {
             useChatStore.getState().sessionsById["persisted:history-1"]
                 ?.isResumingSession,
         ).toBe(true);
+        expect(
+            useChatStore
+                .getState()
+                .sessionsById["persisted:history-1"]?.messages.some(
+                    (message) =>
+                        message.kind === "status" &&
+                        message.content === "Reconnecting saved chat...",
+                ),
+        ).toBe(true);
 
         if (!resolveCreateSession) {
             throw new Error("Missing create-session resolver");
@@ -10470,6 +11153,16 @@ describe("chatStore", () => {
                     (message) =>
                         message.kind === "error" &&
                         message.content === "The ACP process exited.",
+                ),
+        ).toBe(true);
+        expect(
+            useChatStore
+                .getState()
+                .sessionsById[parent.sessionId]?.messages.some(
+                    (message) =>
+                        message.kind === "status" &&
+                        message.content ===
+                            "The AI runtime lost its connection. Reconnecting with saved context...",
                 ),
         ).toBe(true);
         expect(

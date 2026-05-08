@@ -5,13 +5,25 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
     isDebugLogEnabled,
     logDebug,
+    logError,
     logWarn,
     resetRuntimeLogStateForTests,
 } from "./runtimeLog";
+import type { ElectronPreloadApi } from "../runtime/types";
+
+type TestElectronLogBridge = Pick<ElectronPreloadApi, "log">;
+type TestWindowWithLogBridge = Omit<Window, "neverwriteElectron"> & {
+    neverwriteElectron?: TestElectronLogBridge;
+};
+
+function installElectronLogBridge(log: TestElectronLogBridge["log"]) {
+    (window as unknown as TestWindowWithLogBridge).neverwriteElectron = { log };
+}
 
 describe("runtimeLog", () => {
     afterEach(() => {
         resetRuntimeLogStateForTests();
+        delete window.neverwriteElectron;
         vi.restoreAllMocks();
     });
 
@@ -56,6 +68,49 @@ describe("runtimeLog", () => {
         });
         expect(warnSpy).toHaveBeenNthCalledWith(2, "[storage] persist failed", {
             key: "b",
+        });
+    });
+
+    it("forwards warn and error logs to the Electron log bridge", () => {
+        const log = vi.fn().mockResolvedValue(undefined);
+        installElectronLogBridge(log);
+        vi.spyOn(console, "warn").mockImplementation(() => {});
+        vi.spyOn(console, "error").mockImplementation(() => {});
+
+        logWarn("storage", "persist failed", { key: "a" });
+        logError("runtime", "resume failed", new Error("boom"));
+
+        expect(log).toHaveBeenNthCalledWith(
+            1,
+            "warn",
+            "storage",
+            "persist failed",
+            {
+                key: "a",
+            },
+        );
+        expect(log).toHaveBeenNthCalledWith(
+            2,
+            "error",
+            "runtime",
+            "resume failed",
+            expect.any(Error),
+        );
+    });
+
+    it("forwards enabled debug logs to the Electron log bridge", () => {
+        const log = vi.fn().mockResolvedValue(undefined);
+        installElectronLogBridge(log);
+        vi.spyOn(console, "debug").mockImplementation(() => {});
+
+        logDebug("review", "hidden debug log");
+        expect(log).not.toHaveBeenCalled();
+
+        window.__neverwriteLogs?.enable("review");
+        logDebug("review", "enabled debug log", { ok: true });
+
+        expect(log).toHaveBeenCalledWith("debug", "review", "enabled debug log", {
+            ok: true,
         });
     });
 });

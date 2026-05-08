@@ -14,6 +14,7 @@ import {
 } from "../../../components/context-menu/ContextMenu";
 import type {
     AIChatMessage,
+    AIChatSession,
     AIFileDiff,
     AIPermissionOption,
 } from "../types";
@@ -338,6 +339,7 @@ interface AIChatMessageItemProps {
         requestId: string,
         answers: Record<string, string[]>,
     ) => void;
+    onDismissMessage?: (messageId: string) => void;
 }
 
 function stripMarkdownBold(text: string) {
@@ -354,13 +356,59 @@ function getOpenSessionActionLabel(message: AIChatMessage) {
     return name.length > 0 && name.length <= 28 ? `Open ${name}` : "Open";
 }
 
+function sessionMatchesOpenSessionRef(session: AIChatSession, ref: string) {
+    return (
+        session.sessionId === ref ||
+        session.historySessionId === ref ||
+        session.runtimeSessionId === ref
+    );
+}
+
+function resolveOpenSessionActionId(
+    sessionsById: Record<string, AIChatSession>,
+    sessionOrder: string[],
+    ref: string | null,
+) {
+    if (!ref) return null;
+    const candidates = Object.values(sessionsById).filter((session) =>
+        sessionMatchesOpenSessionRef(session, ref),
+    );
+    if (candidates.length === 0) return null;
+
+    const sessionOrderRank = new Map(
+        sessionOrder.map((sessionId, index) => [sessionId, index]),
+    );
+    candidates.sort((left, right) => {
+        const leftLive = left.runtimeState === "live" && !left.isPersistedSession;
+        const rightLive =
+            right.runtimeState === "live" && !right.isPersistedSession;
+        if (leftLive !== rightLive) return leftLive ? -1 : 1;
+
+        const leftExact = left.sessionId === ref;
+        const rightExact = right.sessionId === ref;
+        if (leftExact !== rightExact) return leftExact ? -1 : 1;
+
+        const leftRank = sessionOrderRank.get(left.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        const rightRank =
+            sessionOrderRank.get(right.sessionId) ?? Number.MAX_SAFE_INTEGER;
+        return leftRank - rightRank;
+    });
+
+    return candidates[0].sessionId;
+}
+
 function OpenSessionActionButton({ message }: { message: AIChatMessage }) {
     const openSessionAction =
         message.toolAction?.kind === "open_session" ? message.toolAction : null;
     const openSessionId = openSessionAction?.session_id ?? null;
-    const canOpenSession = useChatStore((state) =>
-        openSessionId ? Boolean(state.sessionsById[openSessionId]) : false,
+    const resolvedOpenSessionId = useChatStore((state) =>
+        resolveOpenSessionActionId(
+            state.sessionsById,
+            state.sessionOrder,
+            openSessionId,
+        ),
     );
+    const canOpenSession = resolvedOpenSessionId !== null;
 
     if (!openSessionAction) {
         return null;
@@ -371,7 +419,7 @@ function OpenSessionActionButton({ message }: { message: AIChatMessage }) {
     return (
         <button
             type="button"
-            disabled={!canOpenSession || !openSessionId}
+            disabled={!canOpenSession}
             className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
             style={{
                 background: "transparent",
@@ -384,8 +432,8 @@ function OpenSessionActionButton({ message }: { message: AIChatMessage }) {
             title={canOpenSession ? label : "Session is not available yet"}
             onClick={(event) => {
                 event.stopPropagation();
-                if (!openSessionId || !canOpenSession) return;
-                void openChatSessionInWorkspace(openSessionId);
+                if (!resolvedOpenSessionId) return;
+                void openChatSessionInWorkspace(resolvedOpenSessionId);
             }}
         >
             {label}
@@ -2660,10 +2708,16 @@ function ChangeReviewPanel({
     );
 }
 
-function ErrorMessage({ message }: { message: AIChatMessage }) {
+function ErrorMessage({
+    message,
+    onDismiss,
+}: {
+    message: AIChatMessage;
+    onDismiss?: (messageId: string) => void;
+}) {
     return (
         <div
-            className="flex min-w-0 max-w-full items-start gap-2 rounded-lg px-2.5 py-2"
+            className="group flex min-w-0 max-w-full items-start gap-2 rounded-lg px-2.5 py-2 pr-1.5"
             style={{
                 color: "#fca5a5",
                 backgroundColor: "color-mix(in srgb, #dc2626 8%, transparent)",
@@ -2694,6 +2748,39 @@ function ErrorMessage({ message }: { message: AIChatMessage }) {
             >
                 {message.content}
             </span>
+            {onDismiss ? (
+                <button
+                    type="button"
+                    aria-label="Dismiss error"
+                    title="Dismiss"
+                    onClick={() => onDismiss(message.id)}
+                    className="ml-auto flex h-5 w-5 shrink-0 items-center justify-center rounded-md opacity-0 transition group-hover:opacity-100 focus-visible:opacity-100"
+                    style={{
+                        color: "#fecaca",
+                        backgroundColor: "transparent",
+                    }}
+                    onMouseEnter={(event) => {
+                        event.currentTarget.style.backgroundColor =
+                            "color-mix(in srgb, #fecaca 12%, transparent)";
+                    }}
+                    onMouseLeave={(event) => {
+                        event.currentTarget.style.backgroundColor =
+                            "transparent";
+                    }}
+                >
+                    <svg
+                        width="12"
+                        height="12"
+                        viewBox="0 0 12 12"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="1.7"
+                        strokeLinecap="round"
+                    >
+                        <path d="M3 3l6 6M9 3L3 9" />
+                    </svg>
+                </button>
+            ) : null}
         </div>
     );
 }
@@ -3270,6 +3357,7 @@ export const AIChatMessageItem = memo(function AIChatMessageItem({
     recentDiffWorkCycleIds = [],
     onPermissionResponse,
     onUserInputResponse,
+    onDismissMessage,
 }: AIChatMessageItemProps) {
     const diffPresentationMode = readOnly
         ? ("recent" as DiffPresentationMode)
@@ -3326,7 +3414,12 @@ export const AIChatMessageItem = memo(function AIChatMessageItem({
 
     // Error — inline with icon
     if (message.kind === "error") {
-        return <ErrorMessage message={message} />;
+        return (
+            <ErrorMessage
+                message={message}
+                onDismiss={readOnly ? undefined : onDismissMessage}
+            />
+        );
     }
 
     // Permission — minimal card

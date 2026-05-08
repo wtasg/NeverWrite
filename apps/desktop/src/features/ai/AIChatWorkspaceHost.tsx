@@ -13,6 +13,7 @@ import {
     emitFileTreeNoteDrag,
     type FileTreeNoteDragDetail,
 } from "./dragEvents";
+import type { AIChatSession } from "./types";
 import {
     createNewChatInWorkspace,
     ensureWorkspaceChatSession,
@@ -33,15 +34,47 @@ function getActiveEditorChatSessionId() {
     return activeTab && isChatTab(activeTab) ? activeTab.sessionId : null;
 }
 
+function needsLiveSessionResumeContextHydration(session: AIChatSession) {
+    if (
+        session.runtimeState !== "live" ||
+        session.resumeContextPending !== true
+    ) {
+        return false;
+    }
+
+    const persistedCount = session.persistedMessageCount ?? 0;
+    return (
+        persistedCount > 0 &&
+        (session.loadedPersistedMessageStart !== 0 ||
+            (session.messages?.length ?? 0) < persistedCount)
+    );
+}
+
+const attachReplayKeyByDetail = new WeakMap<FileTreeNoteDragDetail, string>();
+let nextAttachReplayKey = 1;
+
+function getAttachReplayKey(detail: FileTreeNoteDragDetail) {
+    const existingKey = attachReplayKeyByDetail.get(detail);
+    if (existingKey) return existingKey;
+
+    const key = `attach-replay-${nextAttachReplayKey}`;
+    nextAttachReplayKey += 1;
+    attachReplayKeyByDetail.set(detail, key);
+    return key;
+}
+
 function replayAttachAfterComposerMount(
     detail: FileTreeNoteDragDetail,
     targetSessionId: string,
 ) {
+    const replayKey = getAttachReplayKey(detail);
     // Let the newly opened chat tab mount its composer before we replay the
     // attach event into the real in-workspace target.
     window.requestAnimationFrame(() => {
         window.requestAnimationFrame(() => {
-            emitFileTreeNoteDrag({ ...detail, targetSessionId });
+            const replayDetail = { ...detail, targetSessionId };
+            attachReplayKeyByDetail.set(replayDetail, replayKey);
+            emitFileTreeNoteDrag(replayDetail);
         });
     });
 }
@@ -101,7 +134,7 @@ export function AIChatWorkspaceHost({
     const chatActions = useRef(useChatStore.getState()).current;
     const initializationPromiseRef = useRef<Promise<unknown> | null>(null);
     const recoveringSessionIdRef = useRef<string | null>(null);
-    const attachReplayCountsRef = useRef(new WeakMap<object, number>());
+    const attachReplayCountsRef = useRef(new Map<string, number>());
 
     useAiChatEventBridge(
         Boolean(vaultPath) &&
@@ -162,9 +195,18 @@ export function AIChatWorkspaceHost({
         ) {
             return;
         }
+        if (activeChatSession?.isResumingSession) {
+            return;
+        }
+        if (activeChatSession?.resumeReconnectFailed) {
+            return;
+        }
+        const shouldHydrateLiveResumeContext = activeChatSession
+            ? needsLiveSessionResumeContextHydration(activeChatSession)
+            : false;
         if (
-            activeChatSession?.runtimeState === "live" ||
-            activeChatSession?.isResumingSession
+            activeChatSession?.runtimeState === "live" &&
+            !shouldHydrateLiveResumeContext
         ) {
             return;
         }
@@ -185,21 +227,43 @@ export function AIChatWorkspaceHost({
             const latestSession =
                 useChatStore.getState().sessionsById[activeChatSessionId] ??
                 null;
+            if (latestSession?.isResumingSession) {
+                return;
+            }
+            if (latestSession?.resumeReconnectFailed) {
+                return;
+            }
+            const latestNeedsLiveResumeContextHydration = latestSession
+                ? needsLiveSessionResumeContextHydration(latestSession)
+                : false;
             if (
-                latestSession?.runtimeState === "live" ||
-                latestSession?.isResumingSession
+                latestSession?.runtimeState === "live" &&
+                !latestNeedsLiveResumeContextHydration
             ) {
                 return;
             }
 
-            await chatActions.loadSession(activeChatSessionId);
+            if (latestNeedsLiveResumeContextHydration) {
+                await chatActions.ensureSessionTranscriptLoaded(
+                    activeChatSessionId,
+                    "full",
+                );
+            } else {
+                await chatActions.loadSession(activeChatSessionId);
+            }
         })().finally(() => {
             if (recoveringSessionIdRef.current === activeChatSessionId) {
                 recoveringSessionIdRef.current = null;
             }
         });
     }, [
+        activeChatSession,
         activeChatSession?.isResumingSession,
+        activeChatSession?.loadedPersistedMessageStart,
+        activeChatSession?.messages?.length,
+        activeChatSession?.persistedMessageCount,
+        activeChatSession?.resumeReconnectFailed,
+        activeChatSession?.resumeContextPending,
         activeChatSession?.runtimeState,
         activeChatSessionId,
         chatActions,
@@ -213,7 +277,7 @@ export function AIChatWorkspaceHost({
         const handleAttachWithoutVisibleComposer = (event: Event) => {
             const detail = (event as CustomEvent<FileTreeNoteDragDetail>)
                 .detail;
-            const replayKey = detail as object;
+            const replayKey = getAttachReplayKey(detail);
             if (detail.phase !== "attach") return;
             if (hasVisibleAiComposerDropZone(detail.targetSessionId)) {
                 attachReplayCountsRef.current.delete(replayKey);

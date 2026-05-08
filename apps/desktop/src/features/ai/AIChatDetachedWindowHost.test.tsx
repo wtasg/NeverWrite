@@ -155,6 +155,59 @@ describe("AIChatDetachedWindowHost", () => {
         expect(loadSession).not.toHaveBeenCalled();
     });
 
+    it("hydrates full transcript context for live chats with pending recovery", async () => {
+        useEditorStore.getState().hydrateTabs(
+            [
+                {
+                    id: "chat-tab-1",
+                    kind: "ai-chat",
+                    sessionId: "session-1",
+                    title: "Chat",
+                },
+            ],
+            "chat-tab-1",
+        );
+
+        const initialize = vi.fn().mockResolvedValue(undefined);
+        const loadSession = vi.fn().mockResolvedValue(undefined);
+        const ensureSessionTranscriptLoaded = vi.fn().mockResolvedValue(true);
+        useChatStore.setState({
+            initialize,
+            loadSession,
+            ensureSessionTranscriptLoaded,
+            sessionsById: {
+                "session-1": {
+                    sessionId: "session-1",
+                    historySessionId: "history-1",
+                    runtimeState: "live",
+                    isResumingSession: false,
+                    resumeContextPending: true,
+                    persistedMessageCount: 2,
+                    loadedPersistedMessageStart: 1,
+                    messages: [
+                        {
+                            id: "m2",
+                            role: "assistant",
+                            kind: "text",
+                            content: "Tail only",
+                            timestamp: 20,
+                        },
+                    ],
+                } as never,
+            },
+        } as Partial<ReturnType<typeof useChatStore.getState>>);
+
+        renderComponent(<AIChatWorkspaceHost />);
+        await flushPromises();
+        await flushPromises();
+
+        expect(loadSession).not.toHaveBeenCalled();
+        expect(ensureSessionTranscriptLoaded).toHaveBeenCalledWith(
+            "session-1",
+            "full",
+        );
+    });
+
     it("keeps the main-window event bridge active before any chat tab mounts", () => {
         renderComponent(<AIChatWorkspaceHost listenWithoutChatTabs />);
 
@@ -275,6 +328,61 @@ describe("AIChatDetachedWindowHost", () => {
         } finally {
             targetComposerShell?.remove();
             composerShell.remove();
+            window.removeEventListener(FILE_TREE_NOTE_DRAG_EVENT, handleReplay);
+        }
+    });
+
+    it("caps attach replays even when each replay carries a new detail object", async () => {
+        const replayedEvents: CustomEvent[] = [];
+        const handleReplay = (event: Event) => {
+            replayedEvents.push(event as CustomEvent);
+        };
+        const detail = {
+            phase: "attach" as const,
+            x: 0,
+            y: 0,
+            notes: [
+                {
+                    id: "docs/alpha",
+                    title: "Alpha",
+                    path: "/vault/docs/alpha.md",
+                },
+            ],
+        };
+        chatPaneMovementMock.ensureWorkspaceChatSession.mockResolvedValue(
+            "session-created",
+        );
+        chatPaneMovementMock.openChatSessionInWorkspace.mockReturnValue(
+            "session-created",
+        );
+
+        window.addEventListener(FILE_TREE_NOTE_DRAG_EVENT, handleReplay);
+        try {
+            renderComponent(<AIChatWorkspaceHost listenWithoutChatTabs />);
+
+            window.dispatchEvent(
+                new CustomEvent(FILE_TREE_NOTE_DRAG_EVENT, {
+                    detail,
+                }),
+            );
+
+            await waitFor(() => expect(replayedEvents).toHaveLength(4));
+            await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+            expect(replayedEvents).toHaveLength(4);
+            expect(
+                chatPaneMovementMock.ensureWorkspaceChatSession,
+            ).toHaveBeenCalledTimes(1);
+            expect(
+                chatPaneMovementMock.openChatSessionInWorkspace,
+            ).toHaveBeenCalledTimes(2);
+            expect(replayedEvents.map((event) => event.detail)).toEqual([
+                detail,
+                { ...detail, targetSessionId: "session-created" },
+                { ...detail, targetSessionId: "session-created" },
+                { ...detail, targetSessionId: "session-created" },
+            ]);
+        } finally {
             window.removeEventListener(FILE_TREE_NOTE_DRAG_EVENT, handleReplay);
         }
     });
